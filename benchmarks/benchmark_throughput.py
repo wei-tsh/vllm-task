@@ -71,6 +71,7 @@ def run_vllm(
     dtype: str,
     max_model_len: Optional[int],
     enforce_eager: bool,
+    request_parallel_size: int,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -78,6 +79,7 @@ def run_vllm(
         tokenizer=tokenizer,
         quantization=quantization,
         tensor_parallel_size=tensor_parallel_size,
+        request_parallel_size=request_parallel_size,
         seed=seed,
         trust_remote_code=trust_remote_code,
         dtype=dtype,
@@ -206,7 +208,8 @@ def main(args: argparse.Namespace):
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
-                                args.max_model_len, args.enforce_eager)
+                                args.max_model_len, args.enforce_eager,
+                                args.request_parallel_size)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -249,6 +252,7 @@ if __name__ == "__main__":
                         choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    parser.add_argument("--request-parallel-size", "-rp", type=int, default=1)
     parser.add_argument("--n",
                         type=int,
                         default=1,
