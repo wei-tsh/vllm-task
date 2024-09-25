@@ -115,7 +115,9 @@ class LLMEngine:
         self._init_cache()
 
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config)
+        self.schedulers = [Scheduler(scheduler_config, cache_config)
+                           for i in range(self.parallel_config.request_parallel_size)]
+        
 
         # Logging.
         self.last_logging_time = 0.0
@@ -352,7 +354,8 @@ class LLMEngine:
                                   arrival_time)
 
         # Add the sequence group to the scheduler.
-        self.scheduler.add_seq_group(seq_group)
+        unfinished_seq = [scheduler.get_num_unfinished_seq_groups() for scheduler in self.schedulers]
+        self.schedulers[unfinished_seq.index(min(unfinished_seq))].add_seq_group(seq_group)
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
@@ -360,7 +363,8 @@ class LLMEngine:
         Args:
             request_id: The ID(s) of the request to abort.
         """
-        self.scheduler.abort_seq_group(request_id)
+        for scheduler in self.schedulers:
+            scheduler.abort_seq_group(request_id)
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""
@@ -368,11 +372,14 @@ class LLMEngine:
 
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
-        return self.scheduler.get_num_unfinished_seq_groups()
+        return sum([scheduler.get_num_unfinished_seq_groups for scheduler in self.schedulers])
 
     def has_unfinished_requests(self) -> bool:
         """Returns True if there are unfinished requests."""
-        return self.scheduler.has_unfinished_seqs()
+        for scheduler in self.schedulers:
+            if scheduler.has_unfinished_seqs():
+                return True
+        return False
 
     def _check_beam_search_early_stopping(
         self,
@@ -448,7 +455,8 @@ class LLMEngine:
                 # not be used in the future iterations.
                 parent.status = SequenceStatus.FINISHED_ABORTED
                 seq_group.remove(parent.seq_id)
-                self.scheduler.free_seq(parent)
+                for scheduler in self.schedulers:
+                    scheduler.free_seq(parent)
                 continue
             # Fork the parent sequence if there are multiple child samples.
             for child_sample in child_samples[:-1]:
@@ -477,7 +485,8 @@ class LLMEngine:
                 if seq is not parent:
                     seq_group.add(seq)
                     if not seq.is_finished():
-                        self.scheduler.fork_seq(parent, seq)
+                        for scheduler in self.schedulers:
+                            scheduler.fork_seq(parent, seq)
 
             # Free the finished and selected parent sequences' memory in block
             # manager. Keep them in the sequence group as candidate output.
@@ -485,7 +494,8 @@ class LLMEngine:
             # old sequences.
             for seq, parent in child_seqs:
                 if seq is parent and seq.is_finished():
-                    self.scheduler.free_seq(seq)
+                    for scheduler in self.schedulers:
+                        scheduler.free_seq(parent)
             return
 
         # Beam search case
@@ -572,13 +582,15 @@ class LLMEngine:
             if seq is not parent:
                 seq_group.add(seq)
                 if not seq.is_finished():
-                    self.scheduler.fork_seq(parent, seq)
+                    for scheduler in self.schedulers:
+                        scheduler.fork_seq(parent, seq)
 
         # Free the finished and selected parent sequences' memory in block
         # manager. Keep them in the sequence group as candidate output.
         for seq, parent in selected_child_seqs:
             if seq is parent and seq.is_finished():
-                self.scheduler.free_seq(seq)
+                for scheduler in self.schedulers:
+                    scheduler.free_seq(parent)
 
         # Remove the unselected parent sequences from the sequence group and
         # free their memory in block manager.
@@ -587,30 +599,38 @@ class LLMEngine:
                 # Remove the parent sequence if it is not selected for next
                 # iteration
                 seq_group.remove(seq.seq_id)
-                self.scheduler.free_seq(seq)
+                for scheduler in self.schedulers:
+                    scheduler.free_seq(parent)
 
     def _process_model_outputs(
             self, output: SamplerOutput,
-            scheduler_outputs: SchedulerOutputs) -> List[RequestOutput]:
+            schedulers_outputs: List[SchedulerOutputs]) -> List[RequestOutput]:
         # Update the scheduled sequence groups with the model outputs.
-        scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+        scheduled_seq_groups = List[SequenceGroup]
+        ignored_seq_groups = List[SequenceGroup]
+        for scheduler_outputs in schedulers_outputs:
+            scheduled_seq_groups.extend(scheduler_outputs.scheduled_seq_groups)
+            ignored_seq_groups.extend(scheduler_outputs.ignored_seq_groups)
+        
         for seq_group, outputs in zip(scheduled_seq_groups, output):
             self._process_sequence_group_outputs(seq_group, outputs)
 
         # Free the finished sequence groups.
-        self.scheduler.free_finished_seq_groups()
+        for scheduler in self.schedulers:
+            scheduler.free_finished_seq_groups()
 
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
-        for seq_group in (scheduled_seq_groups +
-                          scheduler_outputs.ignored_seq_groups):
+        for seq_group in (scheduled_seq_groups + ignored_seq_groups):
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
 
         if self.log_stats:
             # Log the system stats.
-            self._log_system_stats(scheduler_outputs.prompt_run,
-                                   scheduler_outputs.num_batched_tokens)
+            self._log_system_stats(sum([scheduler_outputs.prompt_run 
+                                        for scheduler_outputs in schedulers_outputs]),
+                                   sum([scheduler_outputs.num_batched_tokens
+                                        for scheduler_outputs in schedulers_outputs]))
         return request_outputs
 
     def step(self) -> List[RequestOutput]:
@@ -622,17 +642,26 @@ class LLMEngine:
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
-        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        seq_group_metadata_lists = [] 
+        schedulers_outputs = []
+        for scheduler in self.schedulers:
+            seq_group_metadata_list, scheduler_outputs = scheduler.schedule()
+            seq_group_metadata_lists.append(seq_group_metadata_list)
+            schedulers_outputs.append(scheduler_outputs)
 
-        if not scheduler_outputs.is_empty():
+        
+        if not all([scheduler_outputs.is_empty()for scheduler_outpus in scheduler_outputs]):
             # Execute the model.
             all_outputs = self._run_workers(
                 "execute_model",
                 driver_kwargs={
-                    "seq_group_metadata_list": seq_group_metadata_list,
-                    "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
-                    "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
-                    "blocks_to_copy": scheduler_outputs.blocks_to_copy,
+                    "seq_group_metadata_list": seq_group_metadata_lists,
+                    "blocks_to_swap_in": [scheduler_outputs.blocks_to_swap_in 
+                                          for scheduler_outputs in schedulers_outputs],
+                    "blocks_to_swap_out": [scheduler_outputs.blocks_to_swap_out 
+                                          for scheduler_outputs in schedulers_outputs],
+                    "blocks_to_copy": [scheduler_outputs.blocks_to_copy 
+                                          for scheduler_outputs in schedulers_outputs],
                 })
 
             # Only the driver worker returns the sampling results.
@@ -640,7 +669,7 @@ class LLMEngine:
         else:
             output = []
 
-        return self._process_model_outputs(output, scheduler_outputs)
+        return self._process_model_outputs(output, schedulers_outputs)
 
     def _log_system_stats(
         self,
@@ -681,14 +710,14 @@ class LLMEngine:
 
         total_num_gpu_blocks = self.cache_config.num_gpu_blocks
         num_free_gpu_blocks = (
-            self.scheduler.block_manager.get_num_free_gpu_blocks())
+            self.schedulers[0].block_manager.get_num_free_gpu_blocks())
         num_used_gpu_blocks = total_num_gpu_blocks - num_free_gpu_blocks
         gpu_cache_usage = num_used_gpu_blocks / total_num_gpu_blocks
 
         total_num_cpu_blocks = self.cache_config.num_cpu_blocks
         if total_num_cpu_blocks > 0:
             num_free_cpu_blocks = (
-                self.scheduler.block_manager.get_num_free_cpu_blocks())
+                self.schedulers[0].block_manager.get_num_free_cpu_blocks())
             num_used_cpu_blocks = total_num_cpu_blocks - num_free_cpu_blocks
             cpu_cache_usage = num_used_cpu_blocks / total_num_cpu_blocks
         else:
@@ -697,9 +726,9 @@ class LLMEngine:
         record_metrics(
             avg_prompt_throughput=avg_prompt_throughput,
             avg_generation_throughput=avg_generation_throughput,
-            scheduler_running=len(self.scheduler.running),
-            scheduler_swapped=len(self.scheduler.swapped),
-            scheduler_waiting=len(self.scheduler.waiting),
+            scheduler_running=len(sum([scheduler.running for scheduler in self.schedulers],[])),
+            scheduler_swapped=len(sum([scheduler.swapped for scheduler in self.schedulers],[])),
+            scheduler_waiting=len(sum([scheduler.waiting for scheduler in self.schedulers],[])),
             gpu_cache_usage=gpu_cache_usage,
             cpu_cache_usage=cpu_cache_usage,
         )
@@ -708,9 +737,9 @@ class LLMEngine:
                     f"{avg_prompt_throughput:.1f} tokens/s, "
                     "Avg generation throughput: "
                     f"{avg_generation_throughput:.1f} tokens/s, "
-                    f"Running: {len(self.scheduler.running)} reqs, "
-                    f"Swapped: {len(self.scheduler.swapped)} reqs, "
-                    f"Pending: {len(self.scheduler.waiting)} reqs, "
+                    f"Running: {len(sum([scheduler.running for scheduler in self.schedulers],[]))} reqs, "
+                    f"Swapped: {len(sum([scheduler.swapped for scheduler in self.schedulers],[]))} reqs, "
+                    f"Pending: {len(sum([scheduler.waiting for scheduler in self.schedulers],[]))} reqs, "
                     f"GPU KV cache usage: {gpu_cache_usage * 100:.1f}%, "
                     f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
         self.last_logging_time = now
