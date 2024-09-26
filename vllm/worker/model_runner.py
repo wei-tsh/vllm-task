@@ -8,6 +8,8 @@ import torch.nn as nn
 from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig
 from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_request_model_parallel_groups)
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast, broadcast_object_list)
 from vllm.sampling_params import SamplingParams, SamplingType
@@ -325,60 +327,68 @@ class ModelRunner:
 
     def prepare_input_tensors(
         self,
-        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        seq_group_metadata_list: Optional[List[List[SequenceGroupMetadata]]],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata]:
         if self.is_driver_worker:
-            # NOTE: We assume that all sequences in the group are all prompts or
-            # all decodes.
-            is_prompt = seq_group_metadata_list[0].is_prompt
-            # Prepare input tensors.
-            if is_prompt:
-                (input_tokens, input_positions, input_metadata,
-                 prompt_lens) = self._prepare_prompt(seq_group_metadata_list)
-            else:
-                (input_tokens, input_positions, input_metadata
-                 ) = self._prepare_decode(seq_group_metadata_list)
-                prompt_lens = []
-            sampling_metadata = self._prepare_sample(seq_group_metadata_list,
-                                                     prompt_lens)
+            groups = get_request_model_parallel_groups()
 
             def get_size_or_none(x: Optional[torch.Tensor]):
                 return x.size() if x is not None else None
+            
+            for i in range(len(seq_group_metadata_list)):
+                # NOTE: We assume that all sequences in the group are all prompts or
+                # all decodes.
+                is_prompt = seq_group_metadata_list[i][0].is_prompt
+                # Prepare input tensors.
+                if is_prompt:
+                    (broadcast_input_tokens, broadcast_input_positions, broadcast_input_metadata,
+                    prompt_lens) = self._prepare_prompt(seq_group_metadata_list[i])
+                else:
+                    (broadcast_input_tokens, broadcast_input_positions, broadcast_input_metadata
+                    ) = self._prepare_decode(seq_group_metadata_list[i])
+                    prompt_lens = []
+                broadcast_sampling_metadata = self._prepare_sample(seq_group_metadata_list[i],
+                                                        prompt_lens)
 
-            # Broadcast the input data. For input tensors, we first broadcast
-            # its shape and then broadcast the tensor to avoid high
-            # serialization cost.
-            py_data = {
-                "input_tokens_size":
-                input_tokens.size(),
-                "input_positions_size":
-                input_positions.size(),
-                "is_prompt":
-                input_metadata.is_prompt,
-                "slot_mapping_size":
-                get_size_or_none(input_metadata.slot_mapping),
-                "max_context_len":
-                input_metadata.max_context_len,
-                "context_lens_size":
-                get_size_or_none(input_metadata.context_lens),
-                "block_tables_size":
-                get_size_or_none(input_metadata.block_tables),
-                "use_cuda_graph":
-                input_metadata.use_cuda_graph,
-                "selected_token_indices_size":
-                sampling_metadata.selected_token_indices.size(),
-            }
-            broadcast_object_list([py_data], src=0)
-            # TODO(zhuohan): Combine the broadcasts or set async_op=True.
-            broadcast(input_tokens, src=0)
-            broadcast(input_positions, src=0)
-            if input_metadata.slot_mapping is not None:
-                broadcast(input_metadata.slot_mapping, src=0)
-            if input_metadata.context_lens is not None:
-                broadcast(input_metadata.context_lens, src=0)
-            if input_metadata.block_tables is not None:
-                broadcast(input_metadata.block_tables, src=0)
-            broadcast(sampling_metadata.selected_token_indices, src=0)
+                # Broadcast the input data. For input tensors, we first broadcast
+                # its shape and then broadcast the tensor to avoid high
+                # serialization cost.
+                py_data = {
+                    "input_tokens_size":
+                    broadcast_input_tokens.size(),
+                    "input_positions_size":
+                    broadcast_input_positions.size(),
+                    "is_prompt":
+                    broadcast_input_metadata.is_prompt,
+                    "slot_mapping_size":
+                    get_size_or_none(broadcast_input_metadata.slot_mapping),
+                    "max_context_len":
+                    broadcast_input_metadata.max_context_len,
+                    "context_lens_size":
+                    get_size_or_none(broadcast_input_metadata.context_lens),
+                    "block_tables_size":
+                    get_size_or_none(broadcast_input_metadata.block_tables),
+                    "use_cuda_graph":
+                    broadcast_input_metadata.use_cuda_graph,
+                    "selected_token_indices_size":
+                    broadcast_sampling_metadata.selected_token_indices.size(),
+                }
+                broadcast_object_list([py_data], src=0, group=groups[i])
+                # TODO(zhuohan): Combine the broadcasts or set async_op=True.
+                broadcast(broadcast_input_tokens, src=0, group=groups[i])
+                broadcast(broadcast_input_positions, src=0, group=groups[i])
+                if broadcast_input_metadata.slot_mapping is not None:
+                    broadcast(broadcast_input_metadata.slot_mapping, src=0, group=groups[i])
+                if broadcast_input_metadata.context_lens is not None:
+                    broadcast(broadcast_input_metadata.context_lens, src=0, group=groups[i])
+                if broadcast_input_metadata.block_tables is not None:
+                    broadcast(broadcast_input_metadata.block_tables, src=0, group=groups[i])
+                broadcast(broadcast_sampling_metadata.selected_token_indices, src=0, group=groups[i])
+                if i == 0:
+                    input_metadata = broadcast_input_metadata
+                    input_tokens = broadcast_input_tokens
+                    input_positions = broadcast_input_positions
+                    sampling_metadata = broadcast_sampling_metadata
         else:
             receving_list = [None]
             broadcast_object_list(receving_list, src=0)
@@ -439,7 +449,7 @@ class ModelRunner:
     @torch.inference_mode()
     def execute_model(
         self,
-        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        seq_group_metadata_list: Optional[List[List[SequenceGroupMetadata]]],
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Optional[SamplerOutput]:
         input_tokens, input_positions, input_metadata, sampling_metadata = (

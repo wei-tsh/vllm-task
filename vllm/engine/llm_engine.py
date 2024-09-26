@@ -665,7 +665,7 @@ class LLMEngine:
                 })
 
             # Only the driver worker returns the sampling results.
-            output = all_outputs[0]
+            output = sum(all_outputs,[])
         else:
             output = []
 

@@ -11,7 +11,7 @@ from vllm.model_executor import set_random_seed
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast_object_list)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel)
+    initialize_model_parallel,get_request_model_parallel_groups)
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
@@ -156,22 +156,27 @@ class Worker:
     @torch.inference_mode()
     def execute_model(
         self,
-        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
-        blocks_to_swap_in: Optional[Dict[int, int]] = None,
-        blocks_to_swap_out: Optional[Dict[int, int]] = None,
-        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+        seq_group_metadata_list: Optional[List[List[SequenceGroupMetadata]]] = None,
+        blocks_to_swap_in: Optional[List[Dict[int, int]]] = None,
+        blocks_to_swap_out: Optional[List[Dict[int, int]]] = None,
+        blocks_to_copy: Optional[List[Dict[int, List[int]]]] = None,
     ) -> Optional[SamplerOutput]:
         if self.is_driver_worker:
-            assert seq_group_metadata_list is not None
-            num_seq_groups = len(seq_group_metadata_list)
-            assert blocks_to_swap_in is not None
-            assert blocks_to_swap_out is not None
-            assert blocks_to_copy is not None
+            groups = get_request_model_parallel_groups()
+            for i in range(len(seq_group_metadata_list)):
+                assert seq_group_metadata_listp[i] is not None
+                num_seq_groups = len(seq_group_metadata_list[i])
+                assert blocks_to_swap_in[i] is not None
+                assert blocks_to_swap_out[i] is not None
+                assert blocks_to_copy[i] is not None
+                block_swapping_info = [
+                    blocks_to_swap_in[i], blocks_to_swap_out[i], blocks_to_copy[i]
+                ]
+                broadcast_object_list([num_seq_groups] + block_swapping_info,
+                                    src=0, group = groups[i])
             block_swapping_info = [
-                blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy
+                blocks_to_swap_in[0], blocks_to_swap_out[0], blocks_to_copy[0]
             ]
-            broadcast_object_list([num_seq_groups] + block_swapping_info,
-                                  src=0)
         else:
             # num_seq_groups, blocks_to_swap_in, blocks_to_swap_out,
             # blocks_to_copy (4 elements)
@@ -219,7 +224,8 @@ def _init_distributed_environment(
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
-                              parallel_config.pipeline_parallel_size)
+                              parallel_config.pipeline_parallel_size,
+                              parallel_config.request_parallel_size)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
