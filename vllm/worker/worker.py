@@ -11,7 +11,8 @@ from vllm.model_executor import set_random_seed
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast_object_list)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel,get_request_model_parallel_groups)
+    initialize_model_parallel,get_request_model_parallel_group,is_request_model_parallel_first_rank,
+    get_request_model_parallel_first_rank)
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
@@ -156,32 +157,32 @@ class Worker:
     @torch.inference_mode()
     def execute_model(
         self,
-        seq_group_metadata_list: Optional[List[List[SequenceGroupMetadata]]] = None,
-        blocks_to_swap_in: Optional[List[Dict[int, int]]] = None,
-        blocks_to_swap_out: Optional[List[Dict[int, int]]] = None,
-        blocks_to_copy: Optional[List[Dict[int, List[int]]]] = None,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
+        blocks_to_swap_in: Optional[Dict[int, int]] = None,
+        blocks_to_swap_out: Optional[Dict[int, int]] = None,
+        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
     ) -> Optional[SamplerOutput]:
-        if self.is_driver_worker:
-            groups = get_request_model_parallel_groups()
-            for i in range(len(seq_group_metadata_list)):
-                assert seq_group_metadata_listp[i] is not None
-                num_seq_groups = len(seq_group_metadata_list[i])
-                assert blocks_to_swap_in[i] is not None
-                assert blocks_to_swap_out[i] is not None
-                assert blocks_to_copy[i] is not None
-                block_swapping_info = [
-                    blocks_to_swap_in[i], blocks_to_swap_out[i], blocks_to_copy[i]
-                ]
-                broadcast_object_list([num_seq_groups] + block_swapping_info,
-                                    src=0, group = groups[i])
+        group = get_request_model_parallel_group()
+        src = get_request_model_parallel_first_rank()
+        if is_request_model_parallel_first_rank():
+            assert seq_group_metadata_list is not None
+            num_seq_groups = len(seq_group_metadata_list)
+            assert blocks_to_swap_in is not None
+            assert blocks_to_swap_out is not None
+            assert blocks_to_copy is not None
             block_swapping_info = [
-                blocks_to_swap_in[0], blocks_to_swap_out[0], blocks_to_copy[0]
+                blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy
+            ]
+            broadcast_object_list([num_seq_groups] + block_swapping_info,
+                                src=src, group = group)
+            block_swapping_info = [
+                blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy
             ]
         else:
             # num_seq_groups, blocks_to_swap_in, blocks_to_swap_out,
             # blocks_to_copy (4 elements)
             recv_data = [None] * 4
-            broadcast_object_list(recv_data, src=0)
+            broadcast_object_list(recv_data, src=src, group=group)
             num_seq_groups = recv_data[0]
             block_swapping_info = recv_data[1:]
 

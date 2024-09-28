@@ -372,7 +372,7 @@ class LLMEngine:
 
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
-        return sum([scheduler.get_num_unfinished_seq_groups for scheduler in self.schedulers])
+        return sum([scheduler.get_num_unfinished_seq_groups() for scheduler in self.schedulers])
 
     def has_unfinished_requests(self) -> bool:
         """Returns True if there are unfinished requests."""
@@ -426,7 +426,8 @@ class LLMEngine:
         return current_worst_score >= highest_attainable_score
 
     def _process_sequence_group_outputs(self, seq_group: SequenceGroup,
-                                        outputs: SequenceGroupOutput) -> None:
+                                        outputs: SequenceGroupOutput,
+                                        scheduler: Scheduler) -> None:
         # Process prompt logprobs
         prompt_logprobs = outputs.prompt_logprobs
         if prompt_logprobs is not None:
@@ -455,8 +456,7 @@ class LLMEngine:
                 # not be used in the future iterations.
                 parent.status = SequenceStatus.FINISHED_ABORTED
                 seq_group.remove(parent.seq_id)
-                for scheduler in self.schedulers:
-                    scheduler.free_seq(parent)
+                scheduler.free_seq(parent)
                 continue
             # Fork the parent sequence if there are multiple child samples.
             for child_sample in child_samples[:-1]:
@@ -485,8 +485,7 @@ class LLMEngine:
                 if seq is not parent:
                     seq_group.add(seq)
                     if not seq.is_finished():
-                        for scheduler in self.schedulers:
-                            scheduler.fork_seq(parent, seq)
+                        scheduler.fork_seq(parent, seq)
 
             # Free the finished and selected parent sequences' memory in block
             # manager. Keep them in the sequence group as candidate output.
@@ -494,8 +493,7 @@ class LLMEngine:
             # old sequences.
             for seq, parent in child_seqs:
                 if seq is parent and seq.is_finished():
-                    for scheduler in self.schedulers:
-                        scheduler.free_seq(parent)
+                    scheduler.free_seq(parent)
             return
 
         # Beam search case
@@ -582,15 +580,13 @@ class LLMEngine:
             if seq is not parent:
                 seq_group.add(seq)
                 if not seq.is_finished():
-                    for scheduler in self.schedulers:
-                        scheduler.fork_seq(parent, seq)
+                    scheduler.fork_seq(parent, seq)
 
         # Free the finished and selected parent sequences' memory in block
         # manager. Keep them in the sequence group as candidate output.
         for seq, parent in selected_child_seqs:
             if seq is parent and seq.is_finished():
-                for scheduler in self.schedulers:
-                    scheduler.free_seq(parent)
+                scheduler.free_seq(parent)
 
         # Remove the unselected parent sequences from the sequence group and
         # free their memory in block manager.
@@ -599,31 +595,26 @@ class LLMEngine:
                 # Remove the parent sequence if it is not selected for next
                 # iteration
                 seq_group.remove(seq.seq_id)
-                for scheduler in self.schedulers:
-                    scheduler.free_seq(parent)
+                scheduler.free_seq(parent)
 
     def _process_model_outputs(
-            self, output: SamplerOutput,
+            self, outputs: List[SamplerOutput],
             schedulers_outputs: List[SchedulerOutputs]) -> List[RequestOutput]:
-        # Update the scheduled sequence groups with the model outputs.
-        scheduled_seq_groups = List[SequenceGroup]
-        ignored_seq_groups = List[SequenceGroup]
-        for scheduler_outputs in schedulers_outputs:
-            scheduled_seq_groups.extend(scheduler_outputs.scheduled_seq_groups)
-            ignored_seq_groups.extend(scheduler_outputs.ignored_seq_groups)
-        
-        for seq_group, outputs in zip(scheduled_seq_groups, output):
-            self._process_sequence_group_outputs(seq_group, outputs)
-
-        # Free the finished sequence groups.
-        for scheduler in self.schedulers:
-            scheduler.free_finished_seq_groups()
-
-        # Create the outputs.
         request_outputs: List[RequestOutput] = []
-        for seq_group in (scheduled_seq_groups + ignored_seq_groups):
-            request_output = RequestOutput.from_seq_group(seq_group)
-            request_outputs.append(request_output)
+        # Update the scheduled sequence groups with the model outputs.
+        for i in range(len(schedulers_outputs)):
+            scheduled_seq_groups = schedulers_outputs[i].scheduled_seq_groups
+        
+            for seq_group, output in zip(scheduled_seq_groups, outputs[i]):
+                self._process_sequence_group_outputs(seq_group, output, self.schedulers[i])
+
+            # Free the finished sequence groups.
+            self.schedulers[i].free_finished_seq_groups()
+            
+            # Create the outputs.
+            for seq_group in (scheduled_seq_groups + schedulers_outputs[i].ignored_seq_groups):
+                request_output = RequestOutput.from_seq_group(seq_group)
+                request_outputs.append(request_output)
 
         if self.log_stats:
             # Log the system stats.
@@ -642,34 +633,31 @@ class LLMEngine:
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
-        seq_group_metadata_lists = [] 
         schedulers_outputs = []
+        driver_kwargs = []
         for scheduler in self.schedulers:
             seq_group_metadata_list, scheduler_outputs = scheduler.schedule()
-            seq_group_metadata_lists.append(seq_group_metadata_list)
+            driver_kwargs.append({
+                    "seq_group_metadata_list": seq_group_metadata_list,
+                    "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
+                    "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
+                    "blocks_to_copy": scheduler_outputs.blocks_to_copy,
+                })
             schedulers_outputs.append(scheduler_outputs)
 
         
-        if not all([scheduler_outputs.is_empty()for scheduler_outpus in scheduler_outputs]):
+        if not all([scheduler_outputs.is_empty() for scheduler_outputs in schedulers_outputs]):
             # Execute the model.
             all_outputs = self._run_workers(
                 "execute_model",
-                driver_kwargs={
-                    "seq_group_metadata_list": seq_group_metadata_lists,
-                    "blocks_to_swap_in": [scheduler_outputs.blocks_to_swap_in 
-                                          for scheduler_outputs in schedulers_outputs],
-                    "blocks_to_swap_out": [scheduler_outputs.blocks_to_swap_out 
-                                          for scheduler_outputs in schedulers_outputs],
-                    "blocks_to_copy": [scheduler_outputs.blocks_to_copy 
-                                          for scheduler_outputs in schedulers_outputs],
-                })
+                driver_kwargs=driver_kwargs)
 
             # Only the driver worker returns the sampling results.
-            output = sum(all_outputs,[])
+            outputs = all_outputs
         else:
-            output = []
+            outputs = [[]for i in range(len(self.schedulers))]
 
-        return self._process_model_outputs(output, schedulers_outputs)
+        return self._process_model_outputs(outputs, schedulers_outputs)
 
     def _log_system_stats(
         self,
@@ -800,7 +788,7 @@ class LLMEngine:
         method: str,
         *args,
         driver_args: Optional[List[Any]] = None,
-        driver_kwargs: Optional[Dict[str, Any]] = None,
+        driver_kwargs: Optional[List[Dict[str, Any]]] = None,
         max_concurrent_workers: Optional[int] = None,
         **kwargs,
     ) -> Any:
@@ -809,24 +797,36 @@ class LLMEngine:
         if max_concurrent_workers:
             raise NotImplementedError(
                 "max_concurrent_workers is not supported yet.")
-
+        
         # Start the ray workers first.
-        ray_worker_outputs = [
-            worker.execute_method.remote(method, *args, **kwargs)
-            for worker in self.workers
-        ]
+        ray_worker_outputs = []
+        num_cluster = self.parallel_config.pipeline_parallel_size * self.parallel_config.tensor_parallel_size
+        for i in range(len(self.workers)):
+            if driver_kwargs is None or (i+1) % num_cluster != 0:
+                ray_worker_outputs.append(self.workers[i].execute_method.remote(method, *args, **kwargs))
+            else:
+                num = int((i+1) / num_cluster)
+                ray_worker_outputs.append(
+                    self.workers[i].execute_method.remote(method, *args, **(driver_kwargs[num])))
 
         if driver_args is None:
             driver_args = args
         if driver_kwargs is None:
-            driver_kwargs = kwargs
-
+            driver_kwargs = [kwargs]
+        
         # Start the driver worker after all the ray workers.
         driver_worker_output = getattr(self.driver_worker,
-                                       method)(*driver_args, **driver_kwargs)
+                                       method)(*driver_args, **(driver_kwargs[0]))
 
         # Get the results of the ray workers.
         if self.workers:
             ray_worker_outputs = ray.get(ray_worker_outputs)
-
-        return [driver_worker_output] + ray_worker_outputs
+        
+        if driver_kwargs is not None:
+            outputs = [driver_worker_output]
+            for i in range(len(self.workers)):
+                if (i+1) % num_cluster == 0:
+                    outputs.append(ray_worker_outputs[i])
+            return outputs
+        else:
+            return [driver_worker_output] + ray_worker_outputs

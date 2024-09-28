@@ -4,6 +4,8 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_request_model_parallel_first_rank,
+    get_tensor_model_parallel_src_rank,
 )
 
 
@@ -68,12 +70,14 @@ def tensor_model_parallel_gather(input_, dst=0, dim=-1):
         gather_list = [torch.empty_like(input_) for _ in range(world_size)]
     else:
         gather_list = None
+    if dst == 0:
+        dst = get_tensor_model_parallel_src_rank()
     # Gather.
     torch.distributed.gather(input_,
                              gather_list,
                              dst=dst,
                              group=get_tensor_model_parallel_group())
-    if get_tensor_model_parallel_rank() == dst:
+    if get_tensor_model_parallel_rank() == 0:
         output_tensor = torch.cat(gather_list, dim=dim)
     else:
         output_tensor = None
@@ -82,8 +86,12 @@ def tensor_model_parallel_gather(input_, dst=0, dim=-1):
 
 def broadcast(input_, src=0, group=None):
     """Broadcast the input tensor."""
-    world_size = torch.distributed.get_world_size()
-    assert 0 <= src < world_size, f"Invalid src rank ({src})"
+    if group == None:
+        world_size = torch.distributed.get_world_size()
+        assert 0 <= src < world_size, f"Invalid src rank ({src})"
+    else:
+        world_size = torch.distributed.get_world_size(group)
+    
 
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
@@ -95,12 +103,15 @@ def broadcast(input_, src=0, group=None):
 
 def broadcast_object_list(obj_list, src=0, group=None):
     """Broadcast the input object list."""
-    world_size = torch.distributed.get_world_size()
-    assert 0 <= src < world_size, f"Invalid src rank ({src})"
+    if group == None:
+        world_size = torch.distributed.get_world_size()
+        assert 0 <= src < world_size, f"Invalid src rank ({src})"
+    else:
+        world_size = torch.distributed.get_world_size(group)
 
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return obj_list
     # Broadcast.
-    torch.distributed.broadcast_object_list(obj_list, src=src,group=group)
+    torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
     return obj_list

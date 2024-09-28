@@ -238,20 +238,20 @@ if __name__ == "__main__":
                         help="Path to the dataset.")
     parser.add_argument("--input-len",
                         type=int,
-                        default=None,
+                        default=20,
                         help="Input prompt length for each request")
     parser.add_argument("--output-len",
                         type=int,
-                        default=None,
+                        default=10,
                         help="Output length for each request. Overrides the "
                         "output length from the dataset.")
-    parser.add_argument("--model", type=str, default="facebook/opt-125m")
+    parser.add_argument("--model", type=str, default="/data/home/weitsh/vllm/models/opt-125m")
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
                         choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
-    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=2)
     parser.add_argument("--request-parallel-size", "-rp", type=int, default=1)
     parser.add_argument("--n",
                         type=int,

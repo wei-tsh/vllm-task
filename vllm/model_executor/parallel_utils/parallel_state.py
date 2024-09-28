@@ -10,9 +10,10 @@ import torch
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Pipeline model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
-# Request model parallel groups.
-_REQUEST_MODEL_PARALLEL_GROUPS = []
-
+# Request model parallel group that the current rank belongs to.
+_REQUEST_MODEL_PARALLEL_GROUP = None
+_IS_DRIVER = False
+_FIRST_RANK = None
 # A list of global ranks for each pipeline group to ease calculation of the
 # source rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
@@ -89,24 +90,24 @@ def initialize_model_parallel(
             _PIPELINE_GLOBAL_RANKS = ranks
     
     # Build the request model-parallel groups.
-    global _REQUEST_MODEL_PARALLEL_GROUPS
-    assert _REQUEST_MODEL_PARALLEL_GROUPS is [], (
-        "request model parallel group is already initialized")
+    global _REQUEST_MODEL_PARALLEL_GROUP
+    global _IS_DRIVER
+    global _FIRST_RANK
     for i in range(num_request_model_parallel_groups):
-        ranks = list(range(i * num_pipeline_model_parallel_groups * num_tensor_model_parallel_groups,
-                           (i + 1) * num_pipeline_model_parallel_groups * num_tensor_model_parallel_groups))
-        if 0 not in ranks:
-            ranks.append(0)
+        ranks = list(range(i * pipeline_model_parallel_size * tensor_model_parallel_size,
+                           (i + 1) * pipeline_model_parallel_size * tensor_model_parallel_size))
+        if rank == ranks[0]:
+            _IS_DRIVER = True
         group = torch.distributed.new_group(ranks)
-        _REQUEST_MODEL_PARALLEL_GROUPS.append(group)
-        
+        if rank in ranks:
+            _REQUEST_MODEL_PARALLEL_GROUP = group
+            _FIRST_RANK = ranks[0]
 
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return (_TENSOR_MODEL_PARALLEL_GROUP is not None
-            and _PIPELINE_MODEL_PARALLEL_GROUP is not None
-            and _REQUEST_MODEL_PARALLEL_GROUPS is not [])
+            and _PIPELINE_MODEL_PARALLEL_GROUP is not None)
 
 
 def get_tensor_model_parallel_group():
@@ -122,11 +123,12 @@ def get_pipeline_model_parallel_group():
         "pipeline model parallel group is not initialized")
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
-def get_request_model_parallel_groups():
-    """Get all request model parallel groups."""
-    assert _REQUEST_MODEL_PARALLEL_GROUPS is not [],(
+
+def get_request_model_parallel_group():
+    """Get the request model parallel group the caller rank belongs to."""
+    assert _REQUEST_MODEL_PARALLEL_GROUP is not None,(
         "request model parallel group is not initialized")
-    return _REQUEST_MODEL_PARALLEL_GROUPS
+    return _REQUEST_MODEL_PARALLEL_GROUP
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
@@ -142,7 +144,7 @@ def get_pipeline_model_parallel_world_size():
 def get_request_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
     return torch.distributed.get_world_size(
-        group=get_request_model_parallel_groups()[0])
+        group=get_request_model_parallel_group()[0])
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
@@ -162,6 +164,11 @@ def get_tensor_model_parallel_src_rank():
     local_world_size = get_tensor_model_parallel_world_size()
     return (global_rank // local_world_size) * local_world_size
 
+def is_request_model_parallel_first_rank():
+    return _IS_DRIVER
+
+def get_request_model_parallel_first_rank():
+    return _FIRST_RANK
 
 def get_pipeline_model_parallel_first_rank():
     """Return the global rank of the first process in the pipeline for the
